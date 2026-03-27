@@ -1,0 +1,59 @@
+[package]
+name = "benchmarks"
+version = "0.4.0"
+publish = false
+rust-version = "1.70.0"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytes = "1"
+futures = { version = "0.3", features = ["compat"] }
+itoa = "1.0"
+pprof = { version = "0.14", features = ["flamegraph", "prost-codec"] }
+pretty_env_logger = "0.5"
+rumqttc = { path = "../rumqttc" }
+rumqttd = { path = "../rumqttd" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+# paho-mqtt = { git = "https://github.com/eclipse/paho.mqtt.rust" }
+# paho-mqtt = "0.7"
+
+[[bin]]
+name = "rumqttasync"
+path = "clients/rumqttasync.rs"
+
+[[bin]]
+name = "rumqttasyncqos0"
+path = "clients/rumqttasyncqos0.rs"
+
+[[bin]]
+name = "rumqttsync"
+path = "clients/rumqttsync.rs"
+
+[[bin]]
+name = "routernxn"
+path = "router/routernxn.rs"
+
+# [[bin]]
+# name = "pahosync"
+# path = "pahosync.rs"
+
+# [[bin]]
+# name = "pahoasync"
+# path = "pahoasync.rs"
+
+[[bin]]
+name = "v4parser"
+path = "parsers/v4.rs"
+
+[[bin]]
+name = "v5parser"
+path = "parsers/v5.rs"
+
+[[bin]]
+name = "natsparser"
+path = "parsers/nats.rs"
