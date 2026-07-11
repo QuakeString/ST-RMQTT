@@ -2137,7 +2137,6 @@ dependencies = [
  "pretty_assertions",
  "pretty_env_logger",
  "rand",
- "rumqttc",
  "rustls-pemfile",
  "rustls-webpki",
  "serde",

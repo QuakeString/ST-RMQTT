@@ -398,17 +398,20 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
     }
 
     // Depending on TLS or not create a new Network
-    async fn tls_accept(&self, stream: TcpStream) -> Result<(Box<dyn N>, Option<String>), Error> {
+    async fn tls_accept(
+        &self,
+        stream: TcpStream,
+    ) -> Result<(Box<dyn N>, Option<String>, Option<String>), Error> {
         #[cfg(any(feature = "use-rustls", feature = "use-native-tls"))]
         match &self.config.tls {
             Some(c) => {
-                let (tenant_id, network) = TLSAcceptor::new(c)?.accept(stream).await?;
-                Ok((network, tenant_id))
+                let (tenant_id, cn, network) = TLSAcceptor::new(c)?.accept(stream).await?;
+                Ok((network, tenant_id, cn))
             }
-            None => Ok((Box::new(stream), None)),
+            None => Ok((Box::new(stream), None, None)),
         }
         #[cfg(not(any(feature = "use-rustls", feature = "use-native-tls")))]
-        Ok((Box::new(stream), None))
+        Ok((Box::new(stream), None, None))
     }
 
     pub async fn start(&mut self, link_type: LinkType) -> Result<(), Error> {
@@ -432,7 +435,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                 }
             };
 
-            let (network, tenant_id) = match self.tls_accept(stream).await {
+            let (network, tenant_id, cn) = match self.tls_accept(stream).await {
                 Ok(o) => o,
                 Err(e) => {
                     error!(error=?e, "Tls accept error");
@@ -463,6 +466,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                         remote(
                             config,
                             tenant_id.clone(),
+                            cn.clone(),
                             router_tx,
                             stream,
                             protocol,
@@ -479,6 +483,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                     remote(
                         config,
                         tenant_id.clone(),
+                        cn.clone(),
                         router_tx,
                         network,
                         protocol,
@@ -524,6 +529,7 @@ impl Callback for WSCallback {
 async fn remote<P: Protocol>(
     config: Arc<ConnectionSettings>,
     tenant_id: Option<String>,
+    cn: Option<String>,
     router_tx: Sender<(ConnectionId, Event)>,
     stream: Box<dyn N>,
     protocol: P,
@@ -569,7 +575,7 @@ async fn remote<P: Protocol>(
 
     // Authenticate with the finalized client_id (after generation and tenant prefix)
     // This ensures the auth callback receives the correct client_id for session storage
-    if let Err(e) = handle_auth_with_client_id(config, &connect_packet, &client_id).await {
+    if let Err(e) = handle_auth_with_client_id(config, &connect_packet, &client_id, cn).await {
         error!(error=?e, "Authentication failed for client_id={}", client_id);
         return;
     }

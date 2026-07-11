@@ -84,6 +84,18 @@ fn extract_tenant_id(der: &[u8]) -> Result<Option<String>, Error> {
     Ok(Some(tenant_id))
 }
 
+#[cfg(feature = "verify-client-cert")]
+/// Extract the certificate's subject Common Name (CN). Returns None on any
+/// parse failure or absence — never errors.
+fn extract_cn(der: &[u8]) -> Option<String> {
+    let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
+    cert.subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(|s| s.to_string())
+}
+
 #[allow(dead_code)]
 pub enum TLSAcceptor {
     #[cfg(feature = "use-rustls")]
@@ -115,25 +127,30 @@ impl TLSAcceptor {
         }
     }
 
-    pub async fn accept(&self, stream: TcpStream) -> Result<(Option<String>, Box<dyn N>), Error> {
+    pub async fn accept(
+        &self,
+        stream: TcpStream,
+    ) -> Result<(Option<String>, Option<String>, Box<dyn N>), Error> {
         match self {
             #[cfg(feature = "use-rustls")]
             TLSAcceptor::Rustls { acceptor } => {
                 let stream = acceptor.accept(stream).await?;
 
                 #[cfg(feature = "verify-client-cert")]
-                let tenant_id = {
+                let (tenant_id, cn) = {
                     let (_, session) = stream.get_ref();
                     let peer_certificates = session
                         .peer_certificates()
                         .ok_or(Error::NoPeerCertificate)?;
-                    extract_tenant_id(&peer_certificates[0])?
+                    let tenant_id = extract_tenant_id(&peer_certificates[0])?;
+                    let cn = extract_cn(&peer_certificates[0]);
+                    (tenant_id, cn)
                 };
                 #[cfg(not(feature = "verify-client-cert"))]
-                let tenant_id: Option<String> = None;
+                let (tenant_id, cn): (Option<String>, Option<String>) = (None, None);
 
                 let network = Box::new(stream);
-                Ok((tenant_id, network))
+                Ok((tenant_id, cn, network))
             }
             #[cfg(feature = "use-native-tls")]
             TLSAcceptor::NativeTLS { acceptor } => {
@@ -146,7 +163,7 @@ impl TLSAcceptor {
                 //     .to_der()?;
                 // let tenant_id = extract_tenant_id(&peer_certificate)?;
                 let network = Box::new(stream);
-                Ok((None, network))
+                Ok((None, None, network))
             }
         }
     }

@@ -232,18 +232,20 @@ pub async fn handle_auth_with_client_id(
     config: Arc<ConnectionSettings>,
     connect_packet: &Packet,
     final_client_id: &str,
+    cn: Option<String>,
 ) -> Result<(), Error> {
     let login = match connect_packet {
         Packet::Connect(_, _, _, _, ref login) => login.as_ref(),
         _ => return Ok(()),
     };
-    handle_auth(config, login, final_client_id).await
+    handle_auth(config, login, final_client_id, cn).await
 }
 
 async fn handle_auth(
     config: Arc<ConnectionSettings>,
     login: Option<&Login>,
     client_id: &str,
+    cn: Option<String>,
 ) -> Result<(), Error> {
     if config.auth.is_none() && config.external_auth.is_none() {
         return Ok(());
@@ -263,6 +265,7 @@ async fn handle_auth(
             client_id.to_owned(),
             username.to_owned(),
             password.to_owned(),
+            cn.clone(),
         )
         .await
         {
@@ -314,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn no_login_no_auth() {
         let cfg = Arc::new(config());
-        let r = handle_auth(cfg, None, "").await;
+        let r = handle_auth(cfg, None, "", None).await;
         assert!(r.is_ok());
     }
 
@@ -322,7 +325,7 @@ mod tests {
     async fn some_login_no_auth() {
         let cfg = Arc::new(config());
         let login = login();
-        let r = handle_auth(cfg, Some(&login), "").await;
+        let r = handle_auth(cfg, Some(&login), "", None).await;
         assert!(r.is_ok());
     }
 
@@ -335,7 +338,7 @@ mod tests {
         let mut cfg = config();
         cfg.auth = Some(map);
 
-        let r = handle_auth(Arc::new(cfg), Some(&login), "").await;
+        let r = handle_auth(Arc::new(cfg), Some(&login), "", None).await;
         assert!(r.is_ok());
     }
 
@@ -348,7 +351,7 @@ mod tests {
         let mut cfg = config();
         cfg.auth = Some(map);
 
-        let r = handle_auth(Arc::new(cfg), Some(&login), "").await;
+        let r = handle_auth(Arc::new(cfg), Some(&login), "", None).await;
         assert!(r.is_err());
     }
 
@@ -359,13 +362,13 @@ mod tests {
         let mut map = HashMap::<String, String>::new();
         map.insert("wrong".to_owned(), "wrong".to_owned());
 
-        let dynamic = |_: String, _: String, _: String| async { true };
+        let dynamic = |_: String, _: String, _: String, _: Option<String>| async { true };
 
         let mut cfg = config();
         cfg.auth = Some(map);
         cfg.set_auth_handler(dynamic);
 
-        let r = handle_auth(Arc::new(cfg), Some(&login), "").await;
+        let r = handle_auth(Arc::new(cfg), Some(&login), "", None).await;
         assert!(r.is_ok());
     }
 
@@ -376,20 +379,20 @@ mod tests {
         let mut map = HashMap::<String, String>::new();
         map.insert("wrong".to_owned(), "wrong".to_owned());
 
-        let dynamic = |_: String, _: String, _: String| async { false };
+        let dynamic = |_: String, _: String, _: String, _: Option<String>| async { false };
 
         let mut cfg = config();
         cfg.auth = Some(map);
         cfg.set_auth_handler(dynamic);
 
-        let r = handle_auth(Arc::new(cfg), Some(&login), "").await;
+        let r = handle_auth(Arc::new(cfg), Some(&login), "", None).await;
         assert!(r.is_err());
     }
 
     #[tokio::test]
     async fn external_auth_clousre_or_fnptr_type_check_or_fail_compile() {
-        let closure = |_: String, _: String, _: String| async { false };
-        async fn fnptr(_: String, _: String, _: String) -> bool {
+        let closure = |_: String, _: String, _: String, _: Option<String>| async { false };
+        async fn fnptr(_: String, _: String, _: String, _: Option<String>) -> bool {
             true
         }
 

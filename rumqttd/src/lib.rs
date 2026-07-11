@@ -46,7 +46,12 @@ pub type ClientId = String;
 pub type AuthUser = String;
 pub type AuthPass = String;
 pub type AuthHandler = Arc<
-    dyn Fn(ClientId, AuthUser, AuthPass) -> Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+    dyn Fn(
+            ClientId,
+            AuthUser,
+            AuthPass,
+            Option<String>,
+        ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         + Send
         + Sync,
 >;
@@ -125,7 +130,7 @@ pub struct ServerSettings {
 impl ServerSettings {
     pub fn set_auth_handler<F, O>(&mut self, auth_fn: F)
     where
-        F: Fn(ClientId, AuthUser, AuthPass) -> O + Send + Sync + 'static,
+        F: Fn(ClientId, AuthUser, AuthPass, Option<String>) -> O + Send + Sync + 'static,
         O: IntoFuture<Output = bool> + 'static,
         O::IntoFuture: Send,
     {
@@ -161,12 +166,12 @@ pub struct ConnectionSettings {
 impl ConnectionSettings {
     pub fn set_auth_handler<F, O>(&mut self, auth_fn: F)
     where
-        F: Fn(ClientId, AuthUser, AuthPass) -> O + Send + Sync + 'static,
+        F: Fn(ClientId, AuthUser, AuthPass, Option<String>) -> O + Send + Sync + 'static,
         O: IntoFuture<Output = bool> + 'static,
         O::IntoFuture: Send,
     {
-        self.external_auth = Some(Arc::new(move |client_id, username, password| {
-            let auth = auth_fn(client_id, username, password).into_future();
+        self.external_auth = Some(Arc::new(move |client_id, username, password, cert_cn| {
+            let auth = auth_fn(client_id, username, password, cert_cn).into_future();
             Box::pin(auth)
         }));
     }
