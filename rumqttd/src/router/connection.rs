@@ -13,6 +13,14 @@ use super::ConnectionEvents;
 #[derive(Debug)]
 pub struct Connection {
     pub client_id: String,
+    /// True for links created by the broker process itself (`Broker::link`,
+    /// `Broker::link_with_dynamic_filters`), false for anything that connected
+    /// over the network.
+    ///
+    /// The router uses this to decide who may receive a network client's publish.
+    /// It is set by the builder rather than inferred from the client id or the
+    /// topic, so it cannot drift as topics or naming change.
+    pub is_internal: bool,
     /// Id of client's organisation/tenant and the prefix associated with tenant's MQTT topic
     pub tenant_prefix: Option<String>,
     /// Dynamically create subscription filters incase they didn't exist during a publish
@@ -43,6 +51,17 @@ impl Connection {
         clean: bool,
         dynamic_filters: bool,
     ) -> Connection {
+        Self::new_with_internal(tenant_id, client_id, clean, dynamic_filters, false)
+    }
+
+    /// As `new`, but marks whether this connection belongs to the broker process.
+    pub fn new_with_internal(
+        tenant_id: Option<String>,
+        client_id: String,
+        clean: bool,
+        dynamic_filters: bool,
+        is_internal: bool,
+    ) -> Connection {
         // Change client id to -> tenant_id.client_id and derive topic path prefix
         // to validate topics
         let (client_id, tenant_prefix) = match tenant_id {
@@ -56,6 +75,7 @@ impl Connection {
 
         Connection {
             client_id,
+            is_internal,
             tenant_prefix,
             dynamic_filters,
             clean,

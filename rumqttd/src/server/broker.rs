@@ -151,8 +151,9 @@ impl Broker {
     pub fn link(&self, client_id: &str) -> Result<(LinkTx, LinkRx), local::LinkError> {
         // Register this connection with the router. Router replies with ack which if ok will
         // start the link. Router can sometimes reject the connection (ex. max connection limit).
-        let (link_tx, link_rx, _ack) =
-            LinkBuilder::new(client_id, self.router_tx.clone()).build()?;
+        let (link_tx, link_rx, _ack) = LinkBuilder::new(client_id, self.router_tx.clone())
+            .internal(true)
+            .build()?;
         Ok((link_tx, link_rx))
     }
 
@@ -164,6 +165,7 @@ impl Broker {
     ) -> Result<(LinkTx, LinkRx, Notification), local::LinkError> {
         LinkBuilder::new(client_id, self.router_tx.clone())
             .dynamic_filters(true)
+            .internal(true)
             .build()
     }
 

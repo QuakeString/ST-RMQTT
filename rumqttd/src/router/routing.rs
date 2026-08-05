@@ -1624,56 +1624,53 @@ fn forward_device_data(
 
     // Clone values for use in filter closure (avoids borrow checker issues)
     let subscriber_client_id = outgoing.client_id.clone();
-    let filter_topic = request.filter.clone();
+    let subscriber_is_internal = connection.is_internal;
 
     // Fill and notify device data
     let forwards = publishes
         .into_iter()
-        // Filter for session-aware topics: prevent echo and enable server-to-client push
+        // Decide who may receive each message.
         //
-        // Applies to two topic patterns:
-        // 1. /me/ topics (v1/devices/me/attributes, v1/devices/me/telemetry, etc.)
-        //    - Devices publish their own data and subscribe for server pushes
-        // 2. v1/gateway/ topics (v1/gateway/attributes, v1/gateway/telemetry, etc.)
-        //    - Gateway publishes sub-device data and subscribes for platform-to-gateway pushes
-        //    - Without echo prevention, the gateway receives its own publishes back,
-        //      causing the remote configurator to misinterpret sub-device data as config updates
+        // This broker is a device-to-platform transport, not a device-to-device
+        // bus. Every device speaks the same literal topics (`v1/devices/me/...`),
+        // so the topic namespace is shared rather than per-device and topic
+        // matching alone cannot separate one device's traffic from another's.
+        // Delivery is therefore decided by WHO the parties are, not by the topic:
+        //
+        //  * a message the broker process aimed at one client goes to that client;
+        //  * a publish from a network client is uplink, and the platform is its
+        //    only legitimate recipient.
+        //
+        // The previous rule keyed off topic patterns (`/me/`, `v1/gateway/`) and
+        // applied only echo prevention to client publishes, forwarding them to
+        // every other subscriber. Since there is no subscribe ACL, any device could
+        // subscribe to `v1/devices/me/telemetry` or `#` and read every other
+        // device's uplink across all tenants; a device could also be made to act on
+        // another device's RPC request. Topics outside those two patterns —
+        // `/provision/request` among them — were not filtered at all.
         .filter(move |(pubdata, _offset)| {
-            let needs_echo_filter = filter_topic.contains("/me/")
-                || filter_topic.starts_with("v1/gateway/");
-
-            if needs_echo_filter {
-                if let Some(ref publisher_client_id) = pubdata.publisher_client_id {
-                    // Check if this is a server push (has target_client_id in user_properties)
-                    // vs a client publishing its own data (no target_client_id)
-                    let is_server_push = pubdata.properties
-                        .as_ref()
-                        .map(|props| {
-                            props.user_properties
-                                .iter()
-                                .any(|(key, _)| key == "target_client_id")
-                        })
-                        .unwrap_or(false);
-
-                    if is_server_push {
-                        // Server push: extract target_client_id and deliver only to that subscriber
-                        let target = pubdata.properties
-                            .as_ref()
-                            .and_then(|props| {
-                                props.user_properties
-                                    .iter()
-                                    .find(|(key, _)| key == "target_client_id")
-                                    .map(|(_, value)| value.as_str())
-                            });
-                        return target.map_or(false, |t| subscriber_client_id == t);
-                    } else {
-                        // Client publish: prevent echo (do NOT forward back to publisher)
-                        return &subscriber_client_id != publisher_client_id;
-                    }
-                }
+            // A message the broker process addressed to a specific client.
+            let target = pubdata.properties.as_ref().and_then(|props| {
+                props
+                    .user_properties
+                    .iter()
+                    .find(|(key, _)| key == "target_client_id")
+                    .map(|(_, value)| value.as_str())
+            });
+            if let Some(target) = target {
+                return subscriber_client_id == target;
             }
-            // For non-session-aware topics or when publisher_client_id is not set, forward to all subscribers
-            true
+
+            // Otherwise: a publish with no addressee. Only the broker process may
+            // see it, which both delivers uplink to the platform and prevents a
+            // publisher from receiving its own message back.
+            //
+            // Note this also makes an unaddressed `LinkTx::publish` inert towards
+            // devices. That is deliberate: the alternative is broadcasting to every
+            // connected device, so the unsafe call now fails closed. Server-to-
+            // device traffic must use `direct_write_to_client` (preferred, writes
+            // to the connection) or `publish_to_client`.
+            subscriber_is_internal
         })
         .map(|(mut pubdata, offset)| {
             let mut publish = pubdata.publish;
