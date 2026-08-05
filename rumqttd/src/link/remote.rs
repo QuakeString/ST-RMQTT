@@ -99,6 +99,7 @@ impl<P: Protocol> RemoteLink<P> {
             .last_will(lastwill)
             .last_will_properties(lastwill_props)
             .dynamic_filters(dynamic_filters)
+            .assigned_client_id(assigned_client_id.is_some())
             .topic_alias_max(topic_alias_max.unwrap_or(0))
             .build()?;
 

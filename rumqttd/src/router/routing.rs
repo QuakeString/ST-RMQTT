@@ -571,8 +571,18 @@ impl Router {
             connection.events.events.pop_front();
         }
 
-        // Save state for persistent sessions
-        if !connection.clean {
+        // Save state for persistent sessions.
+        //
+        // Not when the broker generated the client id: that id is a fresh uuid the
+        // client can never present again, so the saved session is unreachable the
+        // moment it is written and simply accumulates — one permanent entry per
+        // connect, in a map with no eviction. The ThingsBoard Gateway connects
+        // exactly this way (empty client id with clean_session = false), so this is
+        // the common case, not an edge one.
+        //
+        // Such a session was never resumable in the first place; skipping the save
+        // only stops recording state nothing can ever read.
+        if !connection.clean && !connection.assigned_client_id {
             // Add inflight data requests back to tracker
             inflight_data_requests
                 .into_iter()

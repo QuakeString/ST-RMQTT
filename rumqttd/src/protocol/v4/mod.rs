@@ -213,13 +213,23 @@ fn read_u8(stream: &mut Bytes) -> Result<u8, Error> {
 fn read_mqtt_bytes(stream: &mut Bytes) -> Result<Bytes, Error> {
     let len = read_u16(stream)? as usize;
 
-    // Check if we have enough bytes. If not, return InsufficientBytes so the
-    // network layer can read more data from the socket. This handles TCP segmentation
-    // where CONNECT packets may arrive in multiple segments.
-    // Note: We still validate the length doesn't exceed remaining_length after framing.
+    // A length prefix that overruns the buffer is malformed input, not
+    // segmentation.
+    //
+    // This is only ever reached after `read_mut` has done
+    // `stream.split_to(fixed_header.frame_length())`, so the buffer being parsed
+    // is one complete, detached packet. Incomplete frames are already handled a
+    // layer up: `check()` returns InsufficientBytes and `Network::read` loops on
+    // it, reading more from the socket.
+    //
+    // Returning InsufficientBytes here instead (an earlier attempt to fix CONNECT
+    // segmentation, which was in fact already handled above) made the frame get
+    // discarded silently, so a malformed QoS-1 PUBLISH was never acked and the
+    // client retried it forever; and it made `Network::read` block waiting for
+    // bytes that will never come, so the 4-byte packet `30 02 FF FF` stalled a
+    // connection until keepalive.
     if len > stream.len() {
-        let required = len - stream.len();
-        return Err(Error::InsufficientBytes(required));
+        return Err(Error::BoundaryCrossed(len));
     }
 
     Ok(stream.split_to(len))

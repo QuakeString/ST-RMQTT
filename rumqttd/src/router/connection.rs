@@ -21,6 +21,13 @@ pub struct Connection {
     /// It is set by the builder rather than inferred from the client id or the
     /// topic, so it cannot drift as topics or naming change.
     pub is_internal: bool,
+    /// True when the broker generated this client's id because the CONNECT sent
+    /// an empty one.
+    ///
+    /// Such an id is random and never reused, so the client can never present it
+    /// again and any session saved under it is unreachable. See
+    /// `handle_disconnection`.
+    pub assigned_client_id: bool,
     /// Id of client's organisation/tenant and the prefix associated with tenant's MQTT topic
     pub tenant_prefix: Option<String>,
     /// Dynamically create subscription filters incase they didn't exist during a publish
@@ -62,6 +69,18 @@ impl Connection {
         dynamic_filters: bool,
         is_internal: bool,
     ) -> Connection {
+        Self::build(tenant_id, client_id, clean, dynamic_filters, is_internal, false)
+    }
+
+    /// Full constructor.
+    pub fn build(
+        tenant_id: Option<String>,
+        client_id: String,
+        clean: bool,
+        dynamic_filters: bool,
+        is_internal: bool,
+        assigned_client_id: bool,
+    ) -> Connection {
         // Change client id to -> tenant_id.client_id and derive topic path prefix
         // to validate topics
         let (client_id, tenant_prefix) = match tenant_id {
@@ -76,6 +95,7 @@ impl Connection {
         Connection {
             client_id,
             is_internal,
+            assigned_client_id,
             tenant_prefix,
             dynamic_filters,
             clean,

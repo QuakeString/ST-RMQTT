@@ -49,6 +49,8 @@ pub struct LinkBuilder<'a> {
     dynamic_filters: bool,
     // false by default; true only for links created inside the broker process
     internal: bool,
+    // true when the broker generated the client id (empty id in CONNECT)
+    assigned_client_id: bool,
     // default to 0, indicating to not use topic alias
     topic_alias_max: u16,
 }
@@ -63,6 +65,7 @@ impl<'a> LinkBuilder<'a> {
             last_will: None,
             last_will_properties: None,
             internal: false,
+            assigned_client_id: false,
             dynamic_filters: false,
             topic_alias_max: 0,
         }
@@ -101,6 +104,12 @@ impl<'a> LinkBuilder<'a> {
         self
     }
 
+    /// Record that the broker generated this client's id.
+    pub fn assigned_client_id(mut self, assigned: bool) -> Self {
+        self.assigned_client_id = assigned;
+        self
+    }
+
     /// Mark this link as belonging to the broker process itself.
     ///
     /// Only internal links receive publishes made by network clients — see the
@@ -113,12 +122,13 @@ impl<'a> LinkBuilder<'a> {
     pub fn build(self) -> Result<(LinkTx, LinkRx, Notification), LinkError> {
         // Connect to router
         // Local connections to the router shall have access to all subscriptions
-        let mut connection = Connection::new_with_internal(
+        let mut connection = Connection::build(
             self.tenant_id,
             self.client_id.to_owned(),
             self.clean_session,
             self.dynamic_filters,
             self.internal,
+            self.assigned_client_id,
         );
 
         connection
