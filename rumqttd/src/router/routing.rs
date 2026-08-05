@@ -296,15 +296,25 @@ impl Router {
             client_id: None,
         };
 
-        outgoing.push_notification(Notification::Forward(forward));
-
-        // Signal the connection to wake up and send
-        if let Err(e) = outgoing.handle.try_send(()) {
-            warn!(
-                "DirectWrite: failed to signal client '{}': {:?}",
-                target_client_id, e
+        // Drop rather than queue without bound when the client is not draining.
+        //
+        // This is the only path server-to-device traffic takes, so without a limit
+        // one stalled device — a socket that has stopped reading — grows the router
+        // thread's memory for as long as the platform keeps sending to it. The
+        // commitlog path applies the same cap in `forward_device_data`.
+        let len = outgoing.push_notification(Notification::Forward(forward));
+        if len >= MAX_CHANNEL_CAPACITY - 1 {
+            debug!(
+                "DirectWrite: outgoing buffer full for client '{}', dropping message",
+                target_client_id
             );
         }
+
+        // Signal the connection to wake up and send. A full signal channel just
+        // means a wake-up is already pending, which is the expected state for a
+        // slow client — `.ok()` rather than a warning, matching the commitlog path.
+        // Logging it produced one line per message for any stalled subscriber.
+        outgoing.handle.try_send(()).ok();
     }
 
     fn handle_new_connection(
@@ -321,6 +331,30 @@ impl Router {
 
         let span = tracing::info_span!("incoming_connect", client_id);
         let _guard = span.enter();
+
+        // A network client must never displace a broker-process link.
+        //
+        // MQTT's duplicate-client-id rule below drops the older connection, and
+        // `is_internal` now decides who receives device uplink and who addressed
+        // writes resolve to. Without this guard a device could connect using the
+        // platform link's client id, disconnect it, and both halt ingestion for
+        // every device and become the destination for messages addressed to the
+        // platform.
+        if !connection.is_internal {
+            if let Some(existing) = self.connection_map.get(&client_id) {
+                if self
+                    .connections
+                    .get(*existing)
+                    .is_some_and(|c| c.is_internal)
+                {
+                    error!(
+                        "Rejecting connection: client_id '{}' belongs to an internal link",
+                        client_id
+                    );
+                    return;
+                }
+            }
+        }
 
         if cfg!(not(feature = "allow-duplicate-clientid")) {
             // Check if same client_id already exists and if so, replace it with this new connection
@@ -602,6 +636,35 @@ impl Router {
             match packet {
                 Packet::Publish(mut publish, properties) => {
                     // Topics pass through unchanged - backend handles /me/ resolution via session context
+
+                    // `target_client_id` addresses a message at one connection, and the
+                    // delivery filter trusts it. It is a broker-process concept, but it
+                    // travels as an ordinary MQTT v5 user property, so a device can set
+                    // one on its own PUBLISH. Strip it from anything a network client
+                    // sent, or a device could address messages at any other device on
+                    // the broker — reproduced as cross-tenant RPC injection — suppress
+                    // its own uplink by naming a target that is not the platform, and
+                    // spoof the publisher identity recorded alongside the message.
+                    let properties = match properties {
+                        Some(mut props)
+                            if !self.connections[id].is_internal
+                                && props
+                                    .user_properties
+                                    .iter()
+                                    .any(|(key, _)| key == TARGET_CLIENT_ID) =>
+                        {
+                            warn!(
+                                client_id = %self.obufs[id].client_id,
+                                "Stripped {} from a network client's publish",
+                                TARGET_CLIENT_ID
+                            );
+                            props
+                                .user_properties
+                                .retain(|(key, _)| key != TARGET_CLIENT_ID);
+                            Some(props)
+                        }
+                        other => other,
+                    };
 
                     let span = tracing::error_span!("publish", topic = ?publish.topic, pkid = publish.pkid);
                     let _guard = span.enter();
@@ -1306,7 +1369,7 @@ fn append_to_commitlog(
         .and_then(|props| {
             props.user_properties
                 .iter()
-                .find(|(key, _)| key == "target_client_id")
+                .find(|(key, _)| key == TARGET_CLIENT_ID)
                 .map(|(_, value)| value.clone())
         })
         .unwrap_or_else(|| connection.client_id.clone());
@@ -1654,7 +1717,7 @@ fn forward_device_data(
                 props
                     .user_properties
                     .iter()
-                    .find(|(key, _)| key == "target_client_id")
+                    .find(|(key, _)| key == TARGET_CLIENT_ID)
                     .map(|(_, value)| value.as_str())
             });
             if let Some(target) = target {
@@ -1835,6 +1898,11 @@ fn print_status(router: &mut Router, metrics: Print) {
         }
     };
 }
+
+/// User property that addresses a message at one connection.
+///
+/// Only the broker process may set it; see the strip in `handle_device_payload`.
+pub(crate) const TARGET_CLIENT_ID: &str = "target_client_id";
 
 fn validate_subscription(
     connection: &mut Connection,

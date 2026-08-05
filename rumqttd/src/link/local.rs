@@ -265,7 +265,10 @@ impl LinkTx {
 
         // Store target_client_id in user_properties for router filtering
         let mut properties = PublishProperties::default();
-        properties.user_properties.push(("target_client_id".to_string(), target_client_id.into()));
+        properties.user_properties.push((
+            crate::router::TARGET_CLIENT_ID.to_string(),
+            target_client_id,
+        ));
 
         let len = self.push(Packet::Publish(publish, Some(properties)))?;
         Ok(len)
