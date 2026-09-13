@@ -1935,7 +1935,43 @@ fn validate_subscription(
         return Err(RouterError::InvalidFilterPrefix(filter.path.to_owned()));
     }
 
+    // SENTIENT device-scope subscription ACL. A remote device / external MQTT
+    // client (`is_internal == false`) may only subscribe to its own downlink
+    // topics; the platform's internal ingest/forwarding link
+    // (`is_internal == true`) is trusted and unrestricted. Without this a
+    // device could subscribe to `#` or `v1/devices/<other-uuid>/telemetry` and
+    // eavesdrop on every other device's and tenant's uplink. Enforced
+    // unconditionally -- the pre-existing `validate-tenant-prefix` check above
+    // ships disabled, which is exactly why cross-device isolation was absent.
+    if !connection.is_internal && !sentient_remote_subscription_allowed(&filter.path) {
+        return Err(RouterError::InvalidFilterPrefix(filter.path.to_owned()));
+    }
+
     Ok(())
+}
+
+/// Topics a remote device / external client is permitted to subscribe to.
+///
+/// Every server->device downlink in SENTIENT is under `v1/devices/me/...`
+/// (attributes, attribute responses, RPC requests) or `v1/gateway/...` for a
+/// gateway's sub-devices, plus the provisioning response. `me` is resolved
+/// per-connection from the authenticated session and downlink is addressed to
+/// the specific connection, so a device only ever receives its own data.
+/// Everything else -- `#`, bare wildcards, and explicit `v1/devices/<uuid>/...`
+/// for another device -- is refused, closing cross-device / cross-tenant
+/// eavesdropping. A `$share/<group>/<filter>` shared-subscription wrapper is
+/// unwrapped first and the inner filter judged on its own merits.
+fn sentient_remote_subscription_allowed(path: &str) -> bool {
+    let p = path
+        .strip_prefix("$share/")
+        .and_then(|rest| rest.splitn(2, '/').nth(1))
+        .unwrap_or(path);
+    p == "v1/devices/me"
+        || p.starts_with("v1/devices/me/")
+        || p == "v1/gateway"
+        || p.starts_with("v1/gateway/")
+        || p == "/provision/response"
+        || p == "provision/response"
 }
 
 fn validate_clientid(client_id: &str) -> Result<(), RouterError> {
@@ -2591,3 +2627,47 @@ fn extract_group(filter: &str) -> Option<(String, String)> {
 // //         dbg!(trackers);
 // //     }
 // // }
+
+#[cfg(test)]
+mod sentient_sub_acl_tests {
+    use super::sentient_remote_subscription_allowed as allowed;
+
+    #[test]
+    fn own_downlink_topics_are_allowed() {
+        assert!(allowed("v1/devices/me"));
+        assert!(allowed("v1/devices/me/attributes"));
+        assert!(allowed("v1/devices/me/attributes/response/+"));
+        assert!(allowed("v1/devices/me/rpc/request/+"));
+    }
+
+    #[test]
+    fn gateway_and_provision_topics_are_allowed() {
+        assert!(allowed("v1/gateway"));
+        assert!(allowed("v1/gateway/attributes"));
+        assert!(allowed("v1/gateway/rpc"));
+        assert!(allowed("/provision/response"));
+        assert!(allowed("provision/response"));
+    }
+
+    #[test]
+    fn wildcards_and_other_devices_are_rejected() {
+        assert!(!allowed("#"));
+        assert!(!allowed("+"));
+        assert!(!allowed("v1/devices/+/telemetry"));
+        assert!(!allowed("v1/#"));
+        assert!(!allowed("v1/devices/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/telemetry"));
+        // `me`-prefixed but not the `me` device: must not be treated as own.
+        assert!(!allowed("v1/devices/meta/telemetry"));
+        assert!(!allowed("v1/devices/measure"));
+    }
+
+    #[test]
+    fn shared_subscription_wrapper_is_unwrapped_then_judged() {
+        // A shared-sub over an allowed own topic is allowed.
+        assert!(allowed("$share/g1/v1/devices/me/attributes"));
+        // A shared-sub cannot be used to smuggle a wildcard or another device.
+        assert!(!allowed("$share/g1/#"));
+        assert!(!allowed("$share/g1/v1/devices/+/telemetry"));
+        assert!(!allowed("$share/g1/v1/devices/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb/telemetry"));
+    }
+}
