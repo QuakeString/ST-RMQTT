@@ -333,6 +333,7 @@ mod tests {
             auth: None,
             external_auth: None,
             dynamic_filters: false,
+            disconnect_handler: None,
         }
     }
 

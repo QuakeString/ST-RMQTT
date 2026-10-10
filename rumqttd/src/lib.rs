@@ -112,6 +112,15 @@ pub type AuthHandler = Arc<
         + Sync,
 >;
 
+/// Called once when a remote connection the auth handler accepted ends.
+///
+/// Receives the connection's router id (the [`scoped_client_id`] when the auth
+/// handler returned a namespace, else the client id it was given) and its
+/// [`ConnToken`]. It runs synchronously on the connection's task, so it must
+/// not block or panic: hand the event to a channel (e.g. an unbounded send)
+/// and do the work elsewhere.
+pub type DisconnectHandler = Arc<dyn Fn(ClientId, ConnToken) + Send + Sync>;
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub id: usize,
@@ -196,6 +205,14 @@ impl ServerSettings {
     {
         self.connections.set_auth_handler(auth_fn)
     }
+
+    /// See [`ConnectionSettings::set_disconnect_handler`].
+    pub fn set_disconnect_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(ClientId, ConnToken) + Send + Sync + 'static,
+    {
+        self.connections.set_disconnect_handler(handler)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -221,6 +238,10 @@ pub struct ConnectionSettings {
     pub external_auth: Option<AuthHandler>,
     #[serde(default)]
     pub dynamic_filters: bool,
+    /// Fired once when a connection accepted by auth ends; see
+    /// [`ConnectionSettings::set_disconnect_handler`].
+    #[serde(skip)]
+    pub disconnect_handler: Option<DisconnectHandler>,
 }
 
 impl ConnectionSettings {
@@ -247,6 +268,25 @@ impl ConnectionSettings {
             },
         ));
     }
+
+    /// Install a hook that fires exactly once for every connection the auth
+    /// step accepted, when that connection ends — whatever the cause: the
+    /// client closing, a network error, the router dropping it (duplicate-id
+    /// takeover), or the router refusing to register it (connection limit,
+    /// internal-link guard). Connections refused before or by auth never
+    /// fire it.
+    ///
+    /// The hook receives the router id and the [`ConnToken`] the auth handler
+    /// was given, so an embedder can tell whether the connection that ended is
+    /// still the one it recorded for that id (a fast reconnect may already
+    /// have replaced it). It runs synchronously on the connection's task and
+    /// must not block; see [`DisconnectHandler`].
+    pub fn set_disconnect_handler<F>(&mut self, handler: F)
+    where
+        F: Fn(ClientId, ConnToken) + Send + Sync + 'static,
+    {
+        self.disconnect_handler = Some(Arc::new(handler));
+    }
 }
 
 impl fmt::Debug for ConnectionSettings {
@@ -258,6 +298,7 @@ impl fmt::Debug for ConnectionSettings {
             .field("auth", &self.auth)
             .field("external_auth", &self.external_auth.is_some())
             .field("dynamic_filters", &self.dynamic_filters)
+            .field("disconnect_handler", &self.disconnect_handler.is_some())
             .finish()
     }
 }

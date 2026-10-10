@@ -54,6 +54,7 @@ fn main() {
                 dynamic_filters: true,
                 auth: None,
                 external_auth: None,
+                disconnect_handler: None,
             },
         },
     );
