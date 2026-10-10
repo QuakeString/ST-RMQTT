@@ -424,6 +424,20 @@ impl Router {
             connection.events.events.pop_front();
         }
 
+        // A will is published by the broker on the client's behalf, so it skips
+        // the `target_client_id` strip that `handle_device_payload` applies to
+        // a network client's own PUBLISH. Strip it here too, or an MQTT v5
+        // client could set a will addressed at any other connection and have
+        // the broker deliver it there when the client disconnects.
+        if strip_will_target_client_id(&mut connection.last_will_properties, connection.is_internal)
+        {
+            warn!(
+                client_id = %client_id,
+                "Stripped {} from a network client's last will",
+                TARGET_CLIENT_ID
+            );
+        }
+
         if let Some(will) = connection.last_will.take() {
             self.last_wills.insert(
                 client_id.clone(),
@@ -1245,9 +1259,14 @@ impl Router {
             ..Default::default()
         });
 
+        // Stamp the will with the connection that set it, as an ordinary
+        // publish is stamped, so the embedder can attribute it to the device
+        // whose connection ended. `client_id` is the router id (namespaced
+        // when the auth handler scoped the connection).
         match append_will_message(
             publish,
             properties,
+            client_id,
             &mut self.datalog,
             &mut self.notifications,
             #[cfg(feature = "validate-tenant-prefix")]
@@ -1408,6 +1427,7 @@ fn append_to_commitlog(
 fn append_will_message(
     mut publish: Publish,
     properties: Option<PublishProperties>,
+    publisher_client_id: String,
     datalog: &mut DataLog,
     notifications: &mut VecDeque<(ConnectionId, DataRequest)>,
     #[cfg(feature = "validate-tenant-prefix")] tenant_prefix: Option<String>,
@@ -1457,8 +1477,12 @@ fn append_will_message(
     let mut o = (0, 0);
     for filter_idx in filter_idxs {
         let datalog = datalog.native.get_mut(filter_idx).unwrap();
-        let publish_data = (publish.clone(), properties.clone());
-        let (offset, filter) = datalog.append(publish_data.into(), notifications);
+        let publish_data = PublishData::with_publisher(
+            publish.clone(),
+            properties.clone(),
+            publisher_client_id.clone(),
+        );
+        let (offset, filter) = datalog.append(publish_data, notifications);
         debug!(
             pkid,
             "Appended to commitlog: {}[{}, {})", filter, offset.0, offset.1,
@@ -1974,7 +1998,32 @@ fn sentient_remote_subscription_allowed(path: &str) -> bool {
         || p == "provision/response"
 }
 
-fn validate_clientid(client_id: &str) -> Result<(), RouterError> {
+/// Remove [`TARGET_CLIENT_ID`] from a network client's last-will properties.
+///
+/// Returns whether anything was removed. An internal link's will is trusted
+/// and left untouched, mirroring the strip on ordinary publishes.
+fn strip_will_target_client_id(
+    will_properties: &mut Option<LastWillProperties>,
+    is_internal: bool,
+) -> bool {
+    if is_internal {
+        return false;
+    }
+    let Some(props) = will_properties.as_mut() else {
+        return false;
+    };
+    let before = props.user_properties.len();
+    props
+        .user_properties
+        .retain(|(key, _)| key != TARGET_CLIENT_ID);
+    props.user_properties.len() != before
+}
+
+/// Refuse client ids that contain MQTT topic metacharacters.
+///
+/// Called by `remote()` on the finalized id before the auth handler runs, and
+/// again by the router when the connection registers.
+pub(crate) fn validate_clientid(client_id: &str) -> Result<(), RouterError> {
     trace!("Validating Client ID = {}", client_id,);
     // Ensure that only client devices of the tenant can
     if "+$#/".chars().any(|c| client_id.contains(c)) {
@@ -2669,5 +2718,205 @@ mod sentient_sub_acl_tests {
         assert!(!allowed("$share/g1/#"));
         assert!(!allowed("$share/g1/v1/devices/+/telemetry"));
         assert!(!allowed("$share/g1/v1/devices/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb/telemetry"));
+    }
+}
+
+#[cfg(test)]
+mod will_target_strip_tests {
+    use super::{strip_will_target_client_id, validate_clientid, TARGET_CLIENT_ID};
+    use crate::protocol::LastWillProperties;
+
+    fn props(user_properties: Vec<(String, String)>) -> Option<LastWillProperties> {
+        Some(LastWillProperties {
+            delay_interval: None,
+            payload_format_indicator: None,
+            message_expiry_interval: None,
+            content_type: None,
+            response_topic: None,
+            correlation_data: None,
+            user_properties,
+        })
+    }
+
+    #[test]
+    fn network_client_will_target_is_stripped() {
+        let mut p = props(vec![
+            (TARGET_CLIENT_ID.to_owned(), "victim".to_owned()),
+            ("keep".to_owned(), "me".to_owned()),
+            (TARGET_CLIENT_ID.to_owned(), "victim2".to_owned()),
+        ]);
+        assert!(strip_will_target_client_id(&mut p, false));
+        assert_eq!(
+            p.unwrap().user_properties,
+            vec![("keep".to_owned(), "me".to_owned())]
+        );
+    }
+
+    #[test]
+    fn will_without_target_is_unchanged() {
+        let mut p = props(vec![("keep".to_owned(), "me".to_owned())]);
+        assert!(!strip_will_target_client_id(&mut p, false));
+        assert_eq!(p.unwrap().user_properties.len(), 1);
+
+        let mut none: Option<LastWillProperties> = None;
+        assert!(!strip_will_target_client_id(&mut none, false));
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn internal_link_will_target_is_kept() {
+        let mut p = props(vec![(TARGET_CLIENT_ID.to_owned(), "x".to_owned())]);
+        assert!(!strip_will_target_client_id(&mut p, true));
+        assert_eq!(p.unwrap().user_properties.len(), 1);
+    }
+
+    #[test]
+    fn client_id_metacharacters_are_rejected() {
+        for bad in ["a/b", "a+b", "a#b", "$a", "/", "O.org/x.dev"] {
+            assert!(validate_clientid(bad).is_err(), "{bad} should be rejected");
+        }
+        for ok in ["ESP32Client", "rumqtt-0123abcd", "O.Acme.dev-1", "a.b-c_d"] {
+            assert!(validate_clientid(ok).is_ok(), "{ok} should be accepted");
+        }
+    }
+}
+
+/// Router behaviour for connections registered under a namespaced id
+/// (`AuthOutcome::Accept { namespace: Some(..) }`): the MQTT duplicate-id
+/// takeover, persistent sessions and wills are confined to one namespace.
+#[cfg(test)]
+mod scoped_router_id_tests {
+    use crate::local::{LinkBuilder, LinkRx};
+    use crate::protocol::{LastWill, QoS};
+    use crate::router::{Ack, Event, Notification};
+    use crate::{scoped_client_id, ConnectionId, Router, RouterConfig, Strategy};
+    use bytes::Bytes;
+    use flume::{RecvTimeoutError, Sender};
+    use std::time::{Duration, Instant};
+
+    fn router() -> Sender<(ConnectionId, Event)> {
+        let config = RouterConfig {
+            max_segment_size: 1024 * 1024,
+            max_connections: 64,
+            max_segment_count: 10,
+            max_outgoing_packet_count: 1024,
+            custom_segment: None,
+            initialized_filters: None,
+            shared_subscriptions_strategy: Strategy::RoundRobin,
+        };
+        Router::new(0, config).spawn()
+    }
+
+    /// Connect a "network" link as the auth handler scoped it.
+    fn connect(
+        tx: &Sender<(ConnectionId, Event)>,
+        namespace: &str,
+        raw: &str,
+        clean: bool,
+        will: Option<LastWill>,
+    ) -> (crate::local::LinkTx, LinkRx, bool) {
+        let (link_tx, link_rx, ack) = LinkBuilder::new(raw, tx.clone())
+            .router_client_id(Some(scoped_client_id(namespace, raw)))
+            .clean_session(clean)
+            .last_will(will)
+            .build()
+            .expect("link must connect");
+        let session_present = match ack {
+            Notification::DeviceAck(Ack::ConnAck(_, ack, _)) => ack.session_present,
+            other => panic!("expected ConnAck, got {other:?}"),
+        };
+        (link_tx, link_rx, session_present)
+    }
+
+    /// Whether the router has dropped the link (the takeover / kick path).
+    fn is_dropped(rx: &mut LinkRx) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        loop {
+            match rx.recv_deadline(deadline) {
+                Ok(_) => continue,
+                Err(crate::local::LinkError::RecvTimeout(RecvTimeoutError::Timeout)) => {
+                    return false
+                }
+                Err(_) => return true,
+            }
+        }
+    }
+
+    #[test]
+    fn same_raw_id_in_two_namespaces_does_not_take_over() {
+        let tx = router();
+        let (_a_tx, mut a_rx, _) = connect(&tx, "devA", "ESP32Client", true, None);
+        let (_b_tx, mut b_rx, _) = connect(&tx, "devB", "ESP32Client", true, None);
+        assert!(!is_dropped(&mut a_rx), "device A was kicked by device B");
+        assert!(!is_dropped(&mut b_rx));
+    }
+
+    #[test]
+    fn same_raw_id_in_same_namespace_still_takes_over() {
+        // A device reconnecting with its own id (ESP32 fast reconnect, gateway
+        // restart) keeps the MQTT duplicate-id semantics.
+        let tx = router();
+        let (_a1_tx, mut a1_rx, _) = connect(&tx, "devA", "ESP32Client", true, None);
+        let (_a2_tx, mut a2_rx, _) = connect(&tx, "devA", "ESP32Client", true, None);
+        assert!(is_dropped(&mut a1_rx), "older same-device connection must be replaced");
+        assert!(!is_dropped(&mut a2_rx));
+    }
+
+    #[test]
+    fn persistent_session_is_not_inherited_across_namespaces() {
+        let tx = router();
+        let (mut a_tx, mut a_rx, present) = connect(&tx, "devA", "X", false, None);
+        assert!(!present);
+        a_tx.subscribe("v1/devices/me/rpc/request/+").unwrap();
+        // Wait for the SubAck so the subscription is recorded before disconnecting.
+        let _ = a_rx.recv_deadline(Instant::now() + Duration::from_secs(1));
+        tx.send((a_rx.id(), Event::Disconnect)).unwrap();
+        assert!(is_dropped(&mut a_rx));
+
+        // Another principal on the same raw id starts fresh ...
+        let (_b_tx, mut b_rx, present) = connect(&tx, "devB", "X", false, None);
+        assert!(!present, "device B inherited device A's persistent session");
+        tx.send((b_rx.id(), Event::Disconnect)).unwrap();
+        assert!(is_dropped(&mut b_rx));
+
+        // ... while the owner still resumes its own.
+        let (_a2_tx, _a2_rx, present) = connect(&tx, "devA", "X", false, None);
+        assert!(present, "device A must resume its persistent session");
+    }
+
+    #[test]
+    fn will_is_stamped_with_the_router_id_of_its_connection() {
+        let tx = router();
+        let (mut platform_tx, mut platform_rx, _) =
+            LinkBuilder::new("sentient-processor", tx.clone())
+                .internal(true)
+                .dynamic_filters(true)
+                .build()
+                .unwrap();
+        platform_tx.subscribe("v1/devices/me/telemetry").unwrap();
+        let _ = platform_rx.recv_deadline(Instant::now() + Duration::from_secs(1));
+
+        let will = LastWill {
+            topic: Bytes::from_static(b"v1/devices/me/telemetry"),
+            message: Bytes::from_static(b"{\"online\":false}"),
+            qos: QoS::AtMostOnce,
+            retain: false,
+        };
+        let (_a_tx, _a_rx, _) = connect(&tx, "devA", "X", true, Some(will));
+        tx.send((0, Event::PublishWill(("devA.X".to_owned(), None))))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match platform_rx.recv_deadline(deadline) {
+                Ok(Some(Notification::Forward(f))) => {
+                    assert_eq!(f.publish.payload, Bytes::from_static(b"{\"online\":false}"));
+                    assert_eq!(f.client_id.as_deref(), Some("devA.X"));
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("will never reached the platform link: {e:?}"),
+            }
+        }
     }
 }

@@ -45,13 +45,69 @@ pub type Cursor = (u64, u64);
 pub type ClientId = String;
 pub type AuthUser = String;
 pub type AuthPass = String;
+/// Per-connection token handed to the external auth handler.
+///
+/// Unique for the life of the process (a global counter), so an embedder can
+/// tell two connections that share a client id apart.
+pub type ConnToken = u64;
+
+/// What the external auth handler decided about a CONNECT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// Refuse the connection.
+    Reject,
+    /// Accept the connection.
+    ///
+    /// With `namespace: Some(ns)` the connection registers with the router as
+    /// [`scoped_client_id`]`(ns, client_id)` instead of the client id it sent.
+    /// Every piece of router state keyed by client id — the duplicate-id
+    /// takeover, persistent sessions, wills, addressed writes — is then
+    /// confined to that namespace, so two principals that pick the same client
+    /// id can never displace or inherit each other. The namespace must be
+    /// non-empty and contain none of `+ $ # / .`; an invalid one refuses the
+    /// connection.
+    ///
+    /// With `namespace: None` the connection registers under its client id, as
+    /// it did before namespaces existed.
+    Accept { namespace: Option<String> },
+}
+
+impl From<bool> for AuthOutcome {
+    /// `true` accepts without a namespace, `false` rejects.
+    fn from(accepted: bool) -> Self {
+        if accepted {
+            AuthOutcome::Accept { namespace: None }
+        } else {
+            AuthOutcome::Reject
+        }
+    }
+}
+
+/// The id a connection accepted with `namespace` registers under in the router.
+///
+/// `client_id` is exactly the id the auth handler was given (after empty-id
+/// generation and any tenant prefix), so an embedder can compute the same key
+/// the router uses, and address writes to it, without another callback.
+pub fn scoped_client_id(namespace: &str, client_id: &str) -> String {
+    format!("{namespace}.{client_id}")
+}
+
+/// Whether `namespace` may be used in [`AuthOutcome::Accept`].
+///
+/// Refuses the topic metacharacters the router refuses in a client id, and
+/// `.` so a namespace can never be confused with a namespace plus a prefix.
+pub fn is_valid_namespace(namespace: &str) -> bool {
+    !namespace.is_empty() && !namespace.chars().any(|c| "+$#/.".contains(c))
+}
+
 pub type AuthHandler = Arc<
     dyn Fn(
             ClientId,
             AuthUser,
             AuthPass,
             Option<String>,
-        ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+            ConnToken,
+        ) -> Pin<Box<dyn std::future::Future<Output = AuthOutcome> + Send>>
         + Send
         + Sync,
 >;
@@ -130,8 +186,12 @@ pub struct ServerSettings {
 impl ServerSettings {
     pub fn set_auth_handler<F, O>(&mut self, auth_fn: F)
     where
-        F: Fn(ClientId, AuthUser, AuthPass, Option<String>) -> O + Send + Sync + 'static,
-        O: IntoFuture<Output = bool> + 'static,
+        F: Fn(ClientId, AuthUser, AuthPass, Option<String>, ConnToken) -> O
+            + Send
+            + Sync
+            + 'static,
+        O: IntoFuture + 'static,
+        O::Output: Into<AuthOutcome>,
         O::IntoFuture: Send,
     {
         self.connections.set_auth_handler(auth_fn)
@@ -164,16 +224,28 @@ pub struct ConnectionSettings {
 }
 
 impl ConnectionSettings {
+    /// Install the external auth handler.
+    ///
+    /// It receives the finalized client id, the username, the password, the
+    /// client certificate CN (TLS only) and the connection's [`ConnToken`],
+    /// and returns anything convertible into an [`AuthOutcome`] — a `bool`
+    /// for plain accept/reject, or an `AuthOutcome` to scope the connection.
     pub fn set_auth_handler<F, O>(&mut self, auth_fn: F)
     where
-        F: Fn(ClientId, AuthUser, AuthPass, Option<String>) -> O + Send + Sync + 'static,
-        O: IntoFuture<Output = bool> + 'static,
+        F: Fn(ClientId, AuthUser, AuthPass, Option<String>, ConnToken) -> O
+            + Send
+            + Sync
+            + 'static,
+        O: IntoFuture + 'static,
+        O::Output: Into<AuthOutcome>,
         O::IntoFuture: Send,
     {
-        self.external_auth = Some(Arc::new(move |client_id, username, password, cert_cn| {
-            let auth = auth_fn(client_id, username, password, cert_cn).into_future();
-            Box::pin(auth)
-        }));
+        self.external_auth = Some(Arc::new(
+            move |client_id, username, password, cert_cn, conn_token| {
+                let auth = auth_fn(client_id, username, password, cert_cn, conn_token).into_future();
+                Box::pin(async move { auth.await.into() })
+            },
+        ));
     }
 }
 

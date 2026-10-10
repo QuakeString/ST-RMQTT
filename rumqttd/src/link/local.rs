@@ -53,6 +53,8 @@ pub struct LinkBuilder<'a> {
     assigned_client_id: bool,
     // default to 0, indicating to not use topic alias
     topic_alias_max: u16,
+    // when set, the router registers the connection under exactly this id
+    router_client_id: Option<String>,
 }
 
 impl<'a> LinkBuilder<'a> {
@@ -68,6 +70,7 @@ impl<'a> LinkBuilder<'a> {
             assigned_client_id: false,
             dynamic_filters: false,
             topic_alias_max: 0,
+            router_client_id: None,
         }
     }
 
@@ -110,6 +113,17 @@ impl<'a> LinkBuilder<'a> {
         self
     }
 
+    /// Register the connection with the router under exactly `id`.
+    ///
+    /// Without this the router id is derived from `client_id` (prefixed with
+    /// the tenant id when one is set). The tenant's topic prefix is still
+    /// derived from `tenant_id` either way. Used for connections the external
+    /// auth handler scoped to a namespace.
+    pub fn router_client_id(mut self, id: Option<String>) -> Self {
+        self.router_client_id = id;
+        self
+    }
+
     /// Mark this link as belonging to the broker process itself.
     ///
     /// Only internal links receive publishes made by network clients — see the
@@ -130,6 +144,9 @@ impl<'a> LinkBuilder<'a> {
             self.internal,
             self.assigned_client_id,
         );
+        if let Some(id) = self.router_client_id {
+            connection.client_id = id;
+        }
 
         connection
             .last_will(self.last_will, self.last_will_properties)

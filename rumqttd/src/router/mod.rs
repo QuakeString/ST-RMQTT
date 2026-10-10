@@ -21,7 +21,7 @@ mod graveyard;
 pub mod iobufs;
 mod logs;
 mod routing;
-pub(crate) use routing::TARGET_CLIENT_ID;
+pub(crate) use routing::{validate_clientid, TARGET_CLIENT_ID};
 mod scheduler;
 pub(crate) mod shared_subs;
 mod waiters;

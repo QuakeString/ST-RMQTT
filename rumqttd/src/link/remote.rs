@@ -4,7 +4,7 @@ use crate::link::network::Network;
 use crate::local::LinkBuilder;
 use crate::protocol::{ConnAck, Connect, ConnectReturnCode, Login, Packet, Protocol};
 use crate::router::{Event, Notification};
-use crate::{ConnectionId, ConnectionSettings};
+use crate::{AuthOutcome, ConnToken, ConnectionId, ConnectionSettings};
 
 use flume::{RecvError, SendError, Sender, TrySendError};
 use std::cmp::min;
@@ -37,6 +37,10 @@ pub enum Error {
     SessionEnd,
     #[error("Persistent session requires valid client id")]
     InvalidClientId,
+    #[error("Client id contains a forbidden character: {0}")]
+    ForbiddenClientId(String),
+    #[error("Auth handler returned an invalid namespace: {0:?}")]
+    InvalidNamespace(String),
     #[error("Unexpected router message")]
     NotConnectionAck,
     #[error("ConnAck error {0}")]
@@ -68,6 +72,7 @@ impl<P: Protocol> RemoteLink<P> {
         connect_packet: Packet,
         dynamic_filters: bool,
         assigned_client_id: Option<String>,
+        router_client_id: String,
     ) -> Result<RemoteLink<P>, Error> {
         let Packet::Connect(connect, props, lastwill, lastwill_props, _) = connect_packet else {
             return Err(Error::NotConnectPacket(connect_packet));
@@ -95,6 +100,7 @@ impl<P: Protocol> RemoteLink<P> {
 
         let (link_tx, link_rx, notification) = LinkBuilder::new(client_id, router_tx)
             .tenant_id(tenant_id)
+            .router_client_id(Some(router_client_id))
             .clean_session(clean_session)
             .last_will(lastwill)
             .last_will_properties(lastwill_props)
@@ -229,17 +235,29 @@ where
 
 /// Authenticate the connection with the finalized client_id.
 /// This should be called after client_id is generated (if needed).
+///
+/// On success returns the namespace the external auth handler scoped the
+/// connection to (see [`AuthOutcome::Accept`]), or `None` to register the
+/// connection under `final_client_id` unchanged.
 pub async fn handle_auth_with_client_id(
     config: Arc<ConnectionSettings>,
     connect_packet: &Packet,
     final_client_id: &str,
     cn: Option<String>,
-) -> Result<(), Error> {
+    conn_token: ConnToken,
+) -> Result<Option<String>, Error> {
+    // The router refuses these ids when the connection registers, but that is
+    // after the auth handler has run and the embedder has recorded a session
+    // for the id. Refuse them first, so an id the router will never accept
+    // never reaches the auth handler.
+    if crate::router::validate_clientid(final_client_id).is_err() {
+        return Err(Error::ForbiddenClientId(final_client_id.to_owned()));
+    }
     let login = match connect_packet {
         Packet::Connect(_, _, _, _, ref login) => login.as_ref(),
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
-    handle_auth(config, login, final_client_id, cn).await
+    handle_auth(config, login, final_client_id, cn, conn_token).await
 }
 
 async fn handle_auth(
@@ -247,9 +265,10 @@ async fn handle_auth(
     login: Option<&Login>,
     client_id: &str,
     cn: Option<String>,
-) -> Result<(), Error> {
+    conn_token: ConnToken,
+) -> Result<Option<String>, Error> {
     if config.auth.is_none() && config.external_auth.is_none() {
-        return Ok(());
+        return Ok(None);
     }
 
     // if authentication is configured and connect packet doesn't have login details
@@ -262,24 +281,33 @@ async fn handle_auth(
     let password = &login.password;
 
     if let Some(auth) = &config.external_auth {
-        if !auth(
+        let outcome = auth(
             client_id.to_owned(),
             username.to_owned(),
             password.to_owned(),
             cn.clone(),
+            conn_token,
         )
-        .await
-        {
-            return Err(Error::InvalidAuth);
-        }
-
-        return Ok(());
+        .await;
+        return match outcome {
+            AuthOutcome::Reject => Err(Error::InvalidAuth),
+            AuthOutcome::Accept { namespace: None } => Ok(None),
+            AuthOutcome::Accept {
+                namespace: Some(namespace),
+            } => {
+                if crate::is_valid_namespace(&namespace) {
+                    Ok(Some(namespace))
+                } else {
+                    Err(Error::InvalidNamespace(namespace))
+                }
+            }
+        };
     }
 
     if let Some(pairs) = &config.auth {
         if let Some(stored_password) = pairs.get(username) {
             if stored_password.as_bytes().ct_eq(password.as_bytes()).into() {
-                return Ok(());
+                return Ok(None);
             }
         }
 
@@ -318,7 +346,7 @@ mod tests {
     #[tokio::test]
     async fn no_login_no_auth() {
         let cfg = Arc::new(config());
-        let r = handle_auth(cfg, None, "", None).await;
+        let r = handle_auth(cfg, None, "", None, 1).await;
         assert!(r.is_ok());
     }
 
@@ -326,7 +354,7 @@ mod tests {
     async fn some_login_no_auth() {
         let cfg = Arc::new(config());
         let login = login();
-        let r = handle_auth(cfg, Some(&login), "", None).await;
+        let r = handle_auth(cfg, Some(&login), "", None, 1).await;
         assert!(r.is_ok());
     }
 
@@ -339,7 +367,7 @@ mod tests {
         let mut cfg = config();
         cfg.auth = Some(map);
 
-        let r = handle_auth(Arc::new(cfg), Some(&login), "", None).await;
+        let r = handle_auth(Arc::new(cfg), Some(&login), "", None, 1).await;
         assert!(r.is_ok());
     }
 
@@ -352,7 +380,7 @@ mod tests {
         let mut cfg = config();
         cfg.auth = Some(map);
 
-        let r = handle_auth(Arc::new(cfg), Some(&login), "", None).await;
+        let r = handle_auth(Arc::new(cfg), Some(&login), "", None, 1).await;
         assert!(r.is_err());
     }
 
@@ -363,13 +391,13 @@ mod tests {
         let mut map = HashMap::<String, String>::new();
         map.insert("wrong".to_owned(), "wrong".to_owned());
 
-        let dynamic = |_: String, _: String, _: String, _: Option<String>| async { true };
+        let dynamic = |_: String, _: String, _: String, _: Option<String>, _: u64| async { true };
 
         let mut cfg = config();
         cfg.auth = Some(map);
         cfg.set_auth_handler(dynamic);
 
-        let r = handle_auth(Arc::new(cfg), Some(&login), "", None).await;
+        let r = handle_auth(Arc::new(cfg), Some(&login), "", None, 1).await;
         assert!(r.is_ok());
     }
 
@@ -380,25 +408,175 @@ mod tests {
         let mut map = HashMap::<String, String>::new();
         map.insert("wrong".to_owned(), "wrong".to_owned());
 
-        let dynamic = |_: String, _: String, _: String, _: Option<String>| async { false };
+        let dynamic = |_: String, _: String, _: String, _: Option<String>, _: u64| async { false };
 
         let mut cfg = config();
         cfg.auth = Some(map);
         cfg.set_auth_handler(dynamic);
 
-        let r = handle_auth(Arc::new(cfg), Some(&login), "", None).await;
+        let r = handle_auth(Arc::new(cfg), Some(&login), "", None, 1).await;
         assert!(r.is_err());
+    }
+
+    fn connect_packet(client_id: &str) -> crate::protocol::Packet {
+        crate::protocol::Packet::Connect(
+            crate::protocol::Connect {
+                keep_alive: 10,
+                client_id: client_id.to_owned(),
+                clean_session: true,
+            },
+            None,
+            None,
+            None,
+            Some(login()),
+        )
+    }
+
+    #[tokio::test]
+    async fn forbidden_client_id_is_refused_before_auth_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let counting = |_: String, _: String, _: String, _: Option<String>, _: u64| async {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+        let mut cfg = config();
+        cfg.set_auth_handler(counting);
+        let cfg = Arc::new(cfg);
+
+        for bad in ["a/b", "a+b", "a#b", "$sys", "O.org/x.dev"] {
+            let r = super::handle_auth_with_client_id(cfg.clone(), &connect_packet(bad), bad, None, 1)
+                .await;
+            assert!(
+                matches!(r, Err(super::Error::ForbiddenClientId(ref id)) if id == bad),
+                "{bad}: {r:?}"
+            );
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0, "auth handler must not run");
+
+        // A valid id (including the generated and O.-prefixed forms) still reaches it.
+        for ok in ["ESP32Client", "rumqtt-0123abcd", "O.Acme.dev-1"] {
+            let r =
+                super::handle_auth_with_client_id(cfg.clone(), &connect_packet(ok), ok, None, 1).await;
+            assert!(r.is_ok(), "{ok}: {r:?}");
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn forbidden_client_id_is_refused_without_auth_configured() {
+        let cfg = Arc::new(config());
+        let r = super::handle_auth_with_client_id(cfg, &connect_packet("a/b"), "a/b", None, 1).await;
+        assert!(matches!(r, Err(super::Error::ForbiddenClientId(_))));
     }
 
     #[tokio::test]
     async fn external_auth_clousre_or_fnptr_type_check_or_fail_compile() {
-        let closure = |_: String, _: String, _: String, _: Option<String>| async { false };
-        async fn fnptr(_: String, _: String, _: String, _: Option<String>) -> bool {
+        let closure = |_: String, _: String, _: String, _: Option<String>, _: u64| async { false };
+        async fn fnptr(_: String, _: String, _: String, _: Option<String>, _: u64) -> bool {
             true
+        }
+        async fn scoped(
+            _: String,
+            _: String,
+            _: String,
+            _: Option<String>,
+            _: u64,
+        ) -> crate::AuthOutcome {
+            crate::AuthOutcome::Accept { namespace: None }
         }
 
         let mut cfg = config();
         cfg.set_auth_handler(closure);
         cfg.set_auth_handler(fnptr);
+        cfg.set_auth_handler(scoped);
+    }
+
+    #[tokio::test]
+    async fn external_auth_namespace_is_returned() {
+        let login = login();
+        let mut cfg = config();
+        cfg.set_auth_handler(|cid: String, _: String, _: String, _: Option<String>, tok: u64| async move {
+            crate::AuthOutcome::Accept {
+                namespace: Some(format!("ns{tok}-{}", cid.len())),
+            }
+        });
+        let r = handle_auth(Arc::new(cfg), Some(&login), "abc", None, 42).await;
+        assert_eq!(r.unwrap(), Some("ns42-3".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn external_auth_receives_raw_client_id_and_token() {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<(String, u64)>> = Mutex::new(None);
+        let mut cfg = config();
+        cfg.set_auth_handler(|cid: String, _: String, _: String, _: Option<String>, tok: u64| async move {
+            *SEEN.lock().unwrap() = Some((cid, tok));
+            crate::AuthOutcome::Accept {
+                namespace: Some("dev".to_owned()),
+            }
+        });
+        let r = super::handle_auth_with_client_id(
+            Arc::new(cfg),
+            &connect_packet("O.Acme.esp"),
+            "O.Acme.esp",
+            Some("cn".to_owned()),
+            7,
+        )
+        .await;
+        assert_eq!(r.unwrap(), Some("dev".to_owned()));
+        assert_eq!(
+            SEEN.lock().unwrap().clone(),
+            Some(("O.Acme.esp".to_owned(), 7))
+        );
+    }
+
+    #[tokio::test]
+    async fn external_auth_bool_true_means_no_namespace() {
+        let login = login();
+        let mut cfg = config();
+        cfg.set_auth_handler(|_: String, _: String, _: String, _: Option<String>, _: u64| async { true });
+        let r = handle_auth(Arc::new(cfg), Some(&login), "abc", None, 1).await;
+        assert_eq!(r.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn external_auth_reject_is_invalid_auth() {
+        let login = login();
+        let mut cfg = config();
+        cfg.set_auth_handler(|_: String, _: String, _: String, _: Option<String>, _: u64| async {
+            crate::AuthOutcome::Reject
+        });
+        let r = handle_auth(Arc::new(cfg), Some(&login), "abc", None, 1).await;
+        assert!(matches!(r, Err(super::Error::InvalidAuth)));
+    }
+
+    #[tokio::test]
+    async fn invalid_namespace_refuses_the_connection() {
+        for bad in ["", "a.b", "a/b", "a+b", "a#b", "$a"] {
+            let login = login();
+            let mut cfg = config();
+            let ns = bad.to_owned();
+            cfg.set_auth_handler(move |_: String, _: String, _: String, _: Option<String>, _: u64| {
+                let ns = ns.clone();
+                async move { crate::AuthOutcome::Accept { namespace: Some(ns) } }
+            });
+            let r = handle_auth(Arc::new(cfg), Some(&login), "abc", None, 1).await;
+            assert!(
+                matches!(r, Err(super::Error::InvalidNamespace(ref n)) if n == bad),
+                "{bad:?}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_client_id_joins_namespace_and_raw_id() {
+        assert_eq!(crate::scoped_client_id("dev1", "ESP32Client"), "dev1.ESP32Client");
+        // The O.-prefixed X.509 form keeps its prefix after the namespace.
+        assert_eq!(crate::scoped_client_id("dev1", "O.Acme.x"), "dev1.O.Acme.x");
+        // A scoped id is always a valid router client id.
+        assert!(crate::router::validate_clientid(&crate::scoped_client_id("dev1", "x")).is_ok());
+        assert!(crate::is_valid_namespace("0b1e7c1c-3f7e-4a3b-9a7e-1d2c3b4a5f6e"));
+        assert!(crate::is_valid_namespace("prov17"));
     }
 }

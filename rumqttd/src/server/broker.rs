@@ -10,12 +10,13 @@ use crate::protocol::unified::UnifiedProtocol;
 use crate::protocol::{Packet, Protocol};
 #[cfg(any(feature = "use-rustls", feature = "use-native-tls"))]
 use crate::server::tls::{self, TLSAcceptor};
-use crate::{meters, ConnectionSettings, Meter};
+use crate::{meters, scoped_client_id, ConnectionSettings, Meter};
 use flume::{RecvError, SendError, Sender};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{error, field, info, warn, Instrument};
+use tracing::{error, field, info, warn, Instrument, Span};
 use uuid::Uuid;
 
 #[cfg(feature = "websocket")]
@@ -523,6 +524,9 @@ impl Callback for WSCallback {
     }
 }
 
+/// Source of [`crate::ConnToken`]s: one per remote connection that reaches auth.
+static NEXT_CONN_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 /// A new network connection should wait for a mqtt connect packet. This should be handled
 /// asynchronously to avoid blocking other new connections while this connection is
 /// waiting for mqtt connect packet. Also this honours connection wait time as per config to prevent
@@ -575,12 +579,30 @@ async fn remote<P: Protocol>(
         client_id = format!("{tenant_id}.{client_id}");
     }
 
-    // Authenticate with the finalized client_id (after generation and tenant prefix)
+    // Validate, then authenticate, the finalized client_id (after generation and tenant prefix)
     // This ensures the auth callback receives the correct client_id for session storage
-    if let Err(e) = handle_auth_with_client_id(config, &connect_packet, &client_id, cn).await {
-        error!(error=?e, "Authentication failed for client_id={}", client_id);
-        return;
-    }
+    let conn_token = NEXT_CONN_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let namespace =
+        match handle_auth_with_client_id(config, &connect_packet, &client_id, cn, conn_token).await
+        {
+            Ok(namespace) => namespace,
+            Err(e) => {
+                error!(error=?e, "Connect refused for client_id={}", client_id);
+                return;
+            }
+        };
+
+    // The id this connection is known by in the router. When the auth handler
+    // scoped the connection, every piece of state keyed by client id — the
+    // duplicate-id takeover, the persistent session, the will — is confined to
+    // that namespace, so a different principal reusing the same raw id can
+    // neither displace this connection nor inherit its state. The raw id is
+    // what auth saw and what CONNACK's assigned identifier reports.
+    let client_id = match namespace {
+        Some(namespace) => scoped_client_id(&namespace, &client_id),
+        None => client_id,
+    };
+    Span::current().record("client_id", &client_id);
 
     if let Some(sender) = will_handlers.lock().unwrap().remove(&client_id) {
         let awaiting_will = if clean_session {
@@ -605,6 +627,7 @@ async fn remote<P: Protocol>(
         connect_packet,
         dynamic_filters,
         assigned_client_id,
+        client_id.clone(),
     )
     .await
     {
