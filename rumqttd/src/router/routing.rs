@@ -1996,6 +1996,18 @@ fn sentient_remote_subscription_allowed(path: &str) -> bool {
         || p.starts_with("v1/gateway/")
         || p == "/provision/response"
         || p == "provision/response"
+        || sentient_ota_downlink(p)
+}
+
+/// The OTA package download downlink a device subscribes to
+/// (`v2/fw/response/+/chunk/+`, `v2/fw/error`; `sw` for software). Like the
+/// rest of the downlink it is addressed to the requesting connection, so the
+/// subscription only ever receives that device's own chunks.
+fn sentient_ota_downlink(p: &str) -> bool {
+    ["v2/fw/", "v2/sw/"].iter().any(|prefix| {
+        p.strip_prefix(prefix)
+            .is_some_and(|rest| rest == "error" || rest.starts_with("response/"))
+    })
 }
 
 /// Remove [`TARGET_CLIENT_ID`] from a network client's last-will properties.
@@ -2714,6 +2726,13 @@ mod sentient_sub_acl_tests {
     fn shared_subscription_wrapper_is_unwrapped_then_judged() {
         // A shared-sub over an allowed own topic is allowed.
         assert!(allowed("$share/g1/v1/devices/me/attributes"));
+        assert!(allowed("v2/fw/response/+/chunk/+"));
+        assert!(allowed("v2/sw/response/+/chunk/+"));
+        assert!(allowed("v2/fw/error"));
+        assert!(allowed("v2/sw/error"));
+        assert!(!allowed("v2/fw/request/+/chunk/+"));
+        assert!(!allowed("v2/#"));
+        assert!(!allowed("v2/fw/#"));
         // A shared-sub cannot be used to smuggle a wildcard or another device.
         assert!(!allowed("$share/g1/#"));
         assert!(!allowed("$share/g1/v1/devices/+/telemetry"));

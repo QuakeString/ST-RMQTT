@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Deprecated
 ### Removed
 ### Fixed 
+- Devices can subscribe to the OTA download topics (`v2/fw/response/+/chunk/+`,
+  `v2/fw/error`, and `sw` for software). The subscription was refused and the
+  device disconnected, so firmware could not be fetched over MQTT.
 ### Security
 
 
